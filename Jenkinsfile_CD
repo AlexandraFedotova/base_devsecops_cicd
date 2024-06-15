@@ -1,0 +1,86 @@
+pipeline {
+    agent {label 'kubectl'}
+
+    parameters {
+        string(name: 'repo_url', defaultValue: '', description: 'Git repository url', trim: true)
+        string(name: 'repo_branch', defaultValue: '', description: 'Git repository work branch', trim: true)
+        string(name: 'repo_credentials', defaultValue: '', description: 'Jenkins CredentialsId for access to git repository', trim: true)
+        string(name: 'docker_image', defaultValue: 'rps_game', description: 'Docker image name', trim: true)
+        string(name: 'k8s_credentials', defaultValue: 'KubeConfig', description: 'CredentialsId for kubernetes config', trim: true)
+        string(name: 'k8s_namespace', defaultValue: 'default', description: 'K8s namespace for resource creation', trim: true)
+        booleanParam(name: 'auto_permitted', defaultValue: false, description: 'Is pipeline is permitted or should be permitted by input')
+    }
+
+    stages {
+        stage('Check init params') {
+            steps {
+                script {
+                    if ( "${params.k8s_credentials}" == "") {
+                        echo "Kubernetes credentials (k8s config) is empty"
+                        error('Param k8s_credentials cannot be empty')
+                    }
+                    if ( "${params.k8s_namespace}" == "") {
+                        echo "Kubernetes namespace name is empty"
+                        error('Param k8s_namespace cannot be empty')
+                    }
+                }
+            }
+        }
+        stage('Get permission') {
+            when {
+                beforeInput true
+                expression { return !params.auto_permitted }
+            }
+            input {
+                message "Going to deploy app ${params.docker_image} to K8s namespace ${params.k8s_namespace} - OK?"
+                id "permission"
+                submitter "alex"
+                submitterParameter "submitter_username"
+                parameters {
+                    string(name: "comment", defaultValue: "No comments", description: "Optional comments for this action")
+                }
+            }
+            steps {
+                script {
+                    env.permission = true
+                }
+            }
+        }
+        stage('Check configuration files'){
+            steps {
+                checkout scmGit(
+                    userRemoteConfigs: [[credentialsId: "${repo_credentials}", url: "${repo_url}"]],
+                    branches: [[name: "${repo_branch}"]]
+                )
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    script {
+                        sh 'docker run -v "$PWD:/project" zegl/kube-score:latest score k8s/*.yaml --output-format=ci'
+                    }
+                }
+            }
+        }
+        stage('Deploy app') {
+            when {
+                anyOf { expression { return params.auto_permitted} ; expression { return env.permission } }
+            }
+            steps {
+                withKubeConfig([credentialsId: "${k8s_credentials}", namespace: "${k8s_namespace}"]) {
+                    sh 'kubectl apply -f k8s/game-service.yaml -f k8s/game-deployment.yaml'
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+            script {
+                emailext (
+                    subject: "${env.JOB_BASE_NAME} - ${currentBuild.result}",
+                    body: "BUILD: ${env.BUILD_URL}",
+                    recipientProviders: [requestor()]
+                )
+            }
+        }
+    }
+}

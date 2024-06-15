@@ -1,0 +1,180 @@
+def app
+pipeline {
+    agent {label 'python'}
+    options {
+        timestamps()
+    }
+
+    parameters {
+        string(name: 'repo_url', defaultValue: '', description: 'Git repository url', trim: true)
+        string(name: 'repo_branch', defaultValue: '', description: 'Git repository work branch', trim: true)
+        string(name: 'repo_credentials', defaultValue: '', description: 'Jenkins CredentialsId for access to git repository', trim: true)
+        string(name: 'docker_repo', defaultValue: 'alexandrafedotova', description: 'Repo name for docker (Username for Docker Hub)', trim: true)
+        string(name: 'docker_image', defaultValue: 'rps_game', description: 'Name for docker image', trim: true)
+        string(name: 'docker_tag', defaultValue: '', description: 'Tag for docker image, default - build number', trim: true)
+        booleanParam(name: 'trigger_deploy', defaultValue: true, description: 'Trigger deploy job')
+        string(name: 'trigger_job_name', defaultValue: 'cd_pipeline_base', description: 'Jenkins job for deploying', trim: true)
+    }
+
+    stages {
+        stage('Check init params') {
+            steps {
+                script {
+                    if ("${params.repo_url}" == "") {
+                        echo "Git repository url is empty"
+                        error('Param repo_url cannot be empty')
+                    }
+                    if ("${params.repo_branch}" == "") {
+                        echo "Git repository branch is empty"
+                        error('Param repo_branch cannot be empty')
+                    }
+                    if ("${params.docker_image}" == "") {
+                        echo "Docker image name is empty"
+                        error('Param docker_image cannot be empty')
+                    }
+                    if ("${params.docker_repo}" != "") {
+                        env.DOCKER_IMAGE_FULL_NAME = "${params.docker_repo}/${params.docker_image}"
+                    }
+                    else {
+                        env.DOCKER_IMAGE_FULL_NAME = "${params.docker_image}"
+                    }
+                    if ("${params.docker_tag}" == "" && "${params.repo_branch}" != "master") {
+                        env.DOCKER_IMAGE_FULL_NAME = "${env.DOCKER_IMAGE_FULL_NAME}:${env.BUILD_NUMBER}"
+                    }
+                    if ("${params.docker_tag}" == "" && "${params.repo_branch}" == "master") {
+                        env.DOCKER_IMAGE_FULL_NAME = "${env.DOCKER_IMAGE_FULL_NAME}:master"
+                    }
+                    if ("${params.docker_tag}" != "") {
+                        env.DOCKER_IMAGE_FULL_NAME = "${env.DOCKER_IMAGE_FULL_NAME}:${params.docker_tag}"
+                    }
+                }
+            }
+        }
+        stage('Get source code'){
+            steps {
+                checkout scmGit(
+                    userRemoteConfigs: [[credentialsId: "${repo_credentials}", url: "${repo_url}"]],
+                    branches: [[name: "${repo_branch}"]]
+                )
+            }
+        }
+        stage('Secret scanning') {
+            steps {
+                echo "Run secret scanning"
+                script {
+                    sh "docker run --rm -v ${env.WORKSPACE}:/pwd trufflesecurity/trufflehog:latest github --repo ${params.repo_url} --json"
+                }
+            }
+        }
+        stage('Run SAST') {
+            steps {
+                //script {
+                    // sh 'docker run --rm -e SONAR_HOST_URL="http://176.109.103.123:9000" -e SONAR_TOKEN="a62fce39405ed6876ec2034f860bc0f88115090c" -e SONAR_SCANNER_OPTS="-Dsonar.projectKey=rps_game" -v "$PWD:/usr/src" sonarsource/sonar-scanner-cli'
+                //}
+                script {
+                    scannerHome = tool 'sonar-scanner-1'// must match the name of an actual scanner installation directory on your Jenkins build agent
+                }
+                withSonarQubeEnv('sonar-qube-1') {// If you have configured more than one global server connection, you can specify its name as configured in Jenkins
+                    sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=rps_game"
+                }
+            }
+        }
+        stage('Run SCA') {
+            steps {
+                script {
+                    dependencyCheck additionalArguments: '--enableExperimental --format JSON --format JENKINS --prettyPrint', nvdCredentialsId: 'nvd-api-key', odcInstallation: 'dependency-check-1'
+                }
+            }
+        }
+        stage('Build image') {
+            steps {
+                echo "Build app image: ${env.DOCKER_IMAGE_FULL_NAME}"
+                script {
+                    app = docker.build("${env.DOCKER_IMAGE_FULL_NAME}")
+                }
+            }
+        }
+        stage('Run Container Scanning'){
+            steps {
+                script {
+                    // -v $PWD/Library/Caches:/root/.cache/   -o container-scanning-report.json
+                    sh "ls"
+                    sh "docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v ${env.WORKSPACE}:/pwd aquasec/trivy:latest image ${env.DOCKER_IMAGE_FULL_NAME} --format json"
+                    sh "ls"
+                }
+            }
+        }
+        stage('Run unit tests') {
+            steps {
+                // Do inside container ??
+                withPythonEnv('python3'){
+                    // Install tests requirements
+                    sh 'pip install -r requirements-tests.txt'
+                    // Run pytest
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        sh 'pytest --cov-fail-under=70 --cov=game --cov-report term-missing tests'
+                    }
+                }
+            }
+        }
+        stage('Run DAST') {
+            steps {
+                script {
+                    sh "docker run --rm --name test_app -d -p 80:80 ${env.DOCKER_IMAGE_FULL_NAME}"
+                    sh "docker ps"
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        sh "docker run --rm -v ${env.WORKSPACE}:/zap/wrk/:rw --user=root zaproxy/zap-stable zap-baseline.py -t http://176.123.167.172:80 -t http://176.123.167.172:80/moves -t http://176.123.167.172:80/rock -t http://176.123.167.172:80/paper -t http://176.123.167.172:80/scissors -J dast-baseline-report.json"
+                        //sh "docker run --rm -v ${env.WORKSPACE}:/zap/wrk/:rw --user=root zaproxy/zap-stable zap-api-scan.py -t http://176.123.167.172:80/openapi.json -f openapi -J dast-api-report.json"
+                    }
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        //sh "docker run --rm -v ${env.WORKSPACE}:/zap/wrk/:rw --user=root zaproxy/zap-stable zap-baseline.py -t http://176.123.167.172:80 -t http://176.123.167.172:80/moves -t http://176.123.167.172:80/rock -t http://176.123.167.172:80/paper -t http://176.123.167.172:80/scissors -J dast-baseline-report.json"
+                        sh "docker run --rm -v ${env.WORKSPACE}:/zap/wrk/:rw --user=root zaproxy/zap-stable zap-api-scan.py -t http://176.123.167.172:80/openapi.json -f openapi -J dast-api-report.json"
+                    }
+                    sh "docker stop test_app"
+                }
+
+            }
+        }
+        stage('Push image') {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'DockerCreds') {
+                        app.push()
+                    }
+                }
+            }
+        }
+        stage('Trigger Deploy Job') {
+            when {
+                expression { return params.repo_branch != 'master' }
+                expression { return params.trigger_deploy }
+            }
+            steps {
+                build job: "${trigger_job_name}",
+                      parameters: [
+                        booleanParam(name: 'auto_permitted', value: true),
+                        string(name: 'k8s_credentials', value: 'KubeConfig'),
+                        string(name: 'docker_image', value: "${env.DOCKER_IMAGE_FULL_NAME}"),
+                        string(name: 'repo_url', value: "${params.repo_url}"),
+                        string(name: 'repo_branch', value: "${params.repo_branch}"),
+                        string(name: 'repo_credentials', value: "${params.repo_credentials}")
+                      ],
+                      wait: false
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: '**/*.json', followSymlinks: false
+            cleanWs()
+            script {
+                emailext (
+                    subject: "${env.JOB_BASE_NAME} - ${currentBuild.result}",
+                    body: "BUILD: ${env.BUILD_URL}",
+                    recipientProviders: [requestor()]
+                )
+            }
+        }
+    }
+}
